@@ -1,0 +1,31 @@
+name: Checks
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Shell syntax
+        run: bash -n install.sh warp-xray.sh
+      - name: Python tests
+        run: python3 -m unittest discover -s . -v
+      - name: Verify payload checksums
+        run: sha256sum -c SHA256SUMS
+  debian:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        version: ['12', '13']
+    container: debian:${{ matrix.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test runtime
+        run: apt-get update && apt-get install -y python3 ca-certificates
+      - name: Syntax and unit tests
+        run: |
+          bash -n install.sh warp-xray.sh
+          python3 -m unittest discover -s . -v
+          python3 warp-xray.py --help
+          sha256sum -c SHA256SUMS
