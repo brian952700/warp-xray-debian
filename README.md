@@ -51,6 +51,28 @@ sudo warp-xray setup
 
 ## 管理命令
 
+### 旧版本安装出现 90 秒超时
+
+旧版本对 APT 也使用了 90 秒超时，生成 initramfs 等耗时操作可能被中断。
+已修复：APT 不设执行超时，等待包管理锁最多 300 秒；网络探测仍有短超时。
+
+先查看是否还有包管理进程在工作：
+
+```bash
+ps -eo pid,ppid,etime,args | grep -E '[a]pt-get|[d]pkg|[u]pdate-initramfs|[m]kinitramfs'
+```
+
+若仍在工作，等待结束；不要删除锁文件或强行结束进程。确认结束后，逐条运行，前一条成功再执行下一条：
+
+```bash
+sudo dpkg --configure -a
+sudo apt-get -f install
+```
+
+完成后重新执行本页的一键安装命令，下载新版工具并继续。只运行旧的 `warp-xray setup` 不会更新本地脚本。
+
+### 日常操作
+
 ```bash
 sudo warp-xray status
 sudo warp-xray setup

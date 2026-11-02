@@ -58,6 +58,19 @@ class ConfigTests(unittest.TestCase):
         out = wx.patch_config(self.cfg, wx.DOMAINS, 0, socks_style='current')
         self.assertEqual(out['outbounds'][2]['settings'], {'address': '127.0.0.1', 'port': 40000})
 
+    def test_package_operations_have_no_short_timeout(self):
+        with patch.object(wx, 'run') as run:
+            wx.apt(['install', '-y', 'cloudflare-warp'])
+            self.assertEqual(run.call_args.kwargs['timeout'], None)
+            self.assertEqual(run.call_args.args[0], [
+                'apt-get', '-o', 'DPkg::Lock::Timeout=300',
+                'install', '-y', 'cloudflare-warp'])
+
+    def test_network_probes_keep_short_timeout(self):
+        with patch.object(wx, 'run', return_value=subprocess.CompletedProcess([], 0, 'warp=on\n', '')) as run:
+            wx.probe()
+            self.assertEqual(run.call_args.kwargs['timeout'], 18)
+
     def test_setup_decline_never_applies(self):
         with patch('builtins.input', side_effect=['n', 'n', str(ROOT / 'config.json'), '', '2', 'n', 'n']), \
                 patch.object(wx, 'probe', return_value=(True, {}, '')), \

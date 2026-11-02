@@ -29,6 +29,12 @@ def run(argv, check=True, capture=False, timeout=90):
                           stderr=subprocess.PIPE if capture else None, timeout=timeout)
 
 
+def apt(args):
+    # Package hooks (including initramfs) can legitimately take many minutes.
+    # Never kill apt/dpkg using the short timeout used for service commands.
+    return run(['apt-get', '-o', 'DPkg::Lock::Timeout=300'] + args, timeout=None)
+
+
 def root():
     if os.geteuid() != 0:
         raise ValueError('请使用 sudo/root 运行。')
@@ -147,8 +153,8 @@ def warp(args):
 
 
 def install_warp(_):
-    run(['apt-get', 'update'])
-    run(['apt-get', 'install', '-y', 'curl', 'ca-certificates', 'gnupg', 'python3'])
+    apt(['update'])
+    apt(['install', '-y', 'curl', 'ca-certificates', 'gnupg', 'python3'])
     if not shutil.which('warp-cli'):
         data = dict(line.split('=', 1) for line in Path('/etc/os-release').read_text().splitlines() if '=' in line)
         codename = data.get('VERSION_CODENAME', '').strip('"')
@@ -167,8 +173,10 @@ def install_warp(_):
             shutil.copy2(repo, BASE / ('repo-before-' + str(time.time_ns())))
         repo.write_text(f'deb [signed-by={keyring}] https://pkg.cloudflareclient.com/ {codename} main\n')
         repo.chmod(0o644)
-        run(['apt-get', 'update'])
-        run(['apt-get', 'install', '-y', 'cloudflare-warp'])
+        apt(['update'])
+    # A previous interrupted installation may have created warp-cli without
+    # completing package configuration. Ask APT to finish; do not upgrade it.
+    apt(['install', '--no-upgrade', '-y', 'cloudflare-warp'])
     run(['systemctl', 'enable', '--now', 'warp-svc.service'])
     # Do not delete registrations, licenses or account settings.
     existing = run(['warp-cli', '--accept-tos', 'registration', 'show'], check=False, capture=True)
