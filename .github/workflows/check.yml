@@ -29,3 +29,7 @@ jobs:
           python3 -m unittest discover -s . -v
           python3 warp-xray.py --help
           sha256sum -c SHA256SUMS
+      - name: Installer download-only smoke test
+        run: |
+          bash install.sh --download-only
+          /usr/local/bin/warp-xray --help
