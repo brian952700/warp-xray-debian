@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 import subprocess
 import contextlib
+import io
 
 ROOT = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('wx', ROOT / 'warp-xray.py')
@@ -115,6 +116,55 @@ class ConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             with self.assertRaisesRegex(ValueError, '不能填写目录'):
                 wx.load(temp)
+
+    def test_output_has_no_ansi_when_redirected(self):
+        output = io.StringIO()
+        with patch.object(wx.sys, 'stdout', output):
+            wx.ui.message('ok', '配置已完成')
+        self.assertIn('[成功]', output.getvalue())
+        self.assertNotIn('\033[', output.getvalue())
+
+    def test_no_color_environment_disables_tty_colors(self):
+        output = io.StringIO()
+        with patch.object(output, 'isatty', return_value=True), \
+                patch.object(wx.sys, 'stdout', output), patch.dict(wx.os.environ, {'NO_COLOR': ''}):
+            wx.ui.message('warn', '请检查')
+        self.assertNotIn('\033[', output.getvalue())
+
+    def test_invalid_route_index_can_be_corrected(self):
+        with patch.object(wx.ui, 'ask', side_effect=['foo', '-1', '99', '2']) as ask:
+            self.assertEqual(wx.ask_rule_index(self.cfg['routing']['rules']), 2)
+            self.assertEqual(ask.call_count, 4)
+
+    def test_directory_config_input_can_be_corrected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'config.json'
+            wx.save(path, self.cfg)
+            with patch.object(wx.ui, 'ask', side_effect=[temp, str(path)]) as ask:
+                config, cfg = wx.ask_config()
+            self.assertEqual(config, str(path))
+            self.assertEqual(cfg, self.cfg)
+            self.assertEqual(ask.call_count, 2)
+
+    def test_service_full_path_is_normalized(self):
+        with patch.object(wx.ui, 'ask', return_value='/etc/systemd/system/xray.service'):
+            self.assertEqual(wx.ask_service(), 'xray.service')
+
+    def test_menu_exit_never_changes_system(self):
+        with patch.object(wx.ui, 'ask', return_value='0'), patch.object(wx, 'setup') as setup, \
+                patch.object(wx, 'uninstall') as uninstall, patch.object(wx, 'run') as run:
+            wx.menu(None)
+            setup.assert_not_called()
+            uninstall.assert_not_called()
+            run.assert_not_called()
+
+    def test_hidden_command_failure_still_displays_diagnostics(self):
+        output = io.StringIO()
+        exc = subprocess.CalledProcessError(1, ['xray'], output='invalid config')
+        with patch.object(wx.sys, 'stdout', output):
+            wx.report_error(exc)
+        self.assertIn('invalid config', output.getvalue())
+        self.assertIn('[失败]', output.getvalue())
 
     def test_reject_duplicate_keys_jsonc(self):
         with tempfile.TemporaryDirectory() as temp:

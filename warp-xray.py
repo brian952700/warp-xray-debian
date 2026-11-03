@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 
 BASE = Path('/var/lib/warp-xray')
 ARCHIVES = Path('/var/backups/warp-xray')
@@ -32,6 +33,110 @@ DOMAINS = ['google.com', 'googleapis.com', 'gstatic.com', 'googleusercontent.com
            'doubleclick.net', 'google.co.jp', 'google.co.uk', 'google.com.hk']
 
 
+class TerminalUI:
+    """Small, dependency-free terminal UI. Never clear previous diagnostics."""
+    no_color = False
+    palette = {'title': '1;36', 'info': '36', 'ok': '32', 'warn': '33',
+               'error': '31', 'muted': '90', 'prompt': '1;36'}
+    labels = {'info': '提示', 'ok': '成功', 'warn': '注意', 'error': '失败'}
+
+    def paint(self, text, kind):
+        enabled = (not self.no_color and 'NO_COLOR' not in os.environ and
+                   os.environ.get('TERM') != 'dumb' and sys.stdout.isatty())
+        return f'\033[{self.palette[kind]}m{text}\033[0m' if enabled else str(text)
+
+    def width(self):
+        return max(12, min(72, shutil.get_terminal_size(fallback=(80, 24)).columns - 4))
+
+    def wrap(self, text):
+        # Chinese terminal glyphs occupy two columns. ANSI is added after wrapping.
+        lines, line, size = [], '', 0
+        for char in str(text):
+            if char == '\n':
+                lines.append(line)
+                line, size = '', 0
+                continue
+            width = 0 if unicodedata.combining(char) else (2 if unicodedata.east_asian_width(char) in 'WF' else 1)
+            if size + width > self.width() and line:
+                lines.append(line)
+                line, size = '', 0
+            line += char
+            size += width
+        lines.append(line)
+        return lines
+
+    def text(self, text='', kind=None):
+        for line in self.wrap(text):
+            print('  ' + (self.paint(line, kind) if kind else line), flush=True)
+
+    def section(self, title, subtitle=None):
+        print('', flush=True)
+        self.text('─' * self.width(), 'muted')
+        self.text(title, 'title')
+        if subtitle:
+            self.text(subtitle, 'muted')
+        self.text('─' * self.width(), 'muted')
+        print('', flush=True)
+
+    def message(self, kind, text):
+        self.text(f'[{self.labels[kind]}] {text}', kind)
+
+    def detail(self, label, value):
+        self.text(label + '：', 'muted')
+        print('  ' + str(value), flush=True)
+
+    def command(self, command):
+        print('', flush=True)
+        print(self.paint('  $ ' + command, 'info'), flush=True)
+
+    def ask(self, label, default=None, hint=None):
+        print('', flush=True)
+        self.text(label, 'prompt')
+        if hint:
+            self.text(hint, 'muted')
+        suffix = f' [默认：{default}]' if default is not None else ''
+        answer = input(self.paint('  >' + suffix + ' ', 'prompt')).strip()
+        return answer if answer else (default if default is not None else '')
+
+    def confirm(self, label, hint=None):
+        while True:
+            value = self.ask(label + ' [y/N]', hint=hint).lower()
+            if value in ('y', 'yes', '是'):
+                return True
+            if value in ('', 'n', 'no', '否'):
+                return False
+            self.message('warn', '请输入 y 或 n；直接回车表示否。')
+
+
+ui = TerminalUI()
+
+
+def show_rules(rules):
+    ui.text('现有路由（仅显示出站与匹配字段）', 'muted')
+    for i, rule in enumerate(rules):
+        target = rule.get('outboundTag') or rule.get('balancerTag') or '(未标注)'
+        fields = ', '.join(k for k in rule if k not in ('type', 'outboundTag', 'balancerTag'))
+        ui.text(f'[{i}] → {target}  ·  {fields or "无匹配字段"}')
+
+
+def ask_rule_index(rules):
+    if not rules:
+        ui.message('info', '没有现有路由，将添加到位置 0。')
+        return 0
+    show_rules(rules)
+    ui.text('API / 安全拦截规则留在前面，兜底规则留在 Google 分流之后。', 'muted')
+    while True:
+        answer = ui.ask(f'插入位置：0 ～ {len(rules)}',
+                        hint='N 表示放在原第 N 条之前；最大值表示末尾。')
+        try:
+            index = int(answer)
+            if 0 <= index <= len(rules):
+                return index
+        except ValueError:
+            pass
+        ui.message('warn', f'请输入 0 到 {len(rules)} 之间的整数。')
+
+
 def run(argv, check=True, capture=False, timeout=90):
     return subprocess.run([str(x) for x in argv], check=check, text=True,
                           stdout=subprocess.PIPE if capture else None,
@@ -41,7 +146,12 @@ def run(argv, check=True, capture=False, timeout=90):
 def apt(args):
     # Package hooks (including initramfs) can legitimately take many minutes.
     # Never kill apt/dpkg using the short timeout used for service commands.
-    return run(['apt-get', '-o', 'DPkg::Lock::Timeout=300'] + args, timeout=None)
+    title = '更新软件源' if args[0] == 'update' else ('卸载 WARP 软件包' if args[0] == 'purge' else '安装 / 检查软件包')
+    ui.section(title, '以下为系统包管理器输出；耗时操作会等待完成。')
+    result = run(['apt-get', '-o', 'DPkg::Lock::Timeout=300'] + args, timeout=None)
+    print('', flush=True)
+    ui.message('ok', title + '完成。')
+    return result
 
 
 def root():
@@ -149,7 +259,9 @@ def service_context(service, config):
 
 def validate(binary, path):
     # Keep output on terminal; never publish full configs or private keys in reports.
-    run([binary, 'run', '-test', '-config', path])
+    ui.message('info', '正在校验 Xray 配置…')
+    run([binary, 'run', '-test', '-config', path], capture=True)
+    ui.message('ok', 'Xray 配置校验通过。')
 
 
 def probe(family=None):
@@ -166,7 +278,8 @@ def probe(family=None):
 
 
 def warp(args):
-    run(['warp-cli', '--accept-tos'] + args)
+    # Avoid several bare "Success" lines; failures are printed with diagnostics.
+    run(['warp-cli', '--accept-tos'] + args, capture=True)
 
 
 def install_warp(_):
@@ -194,6 +307,7 @@ def install_warp(_):
     # A previous interrupted installation may have created warp-cli without
     # completing package configuration. Ask APT to finish; do not upgrade it.
     apt(['install', '--no-upgrade', '-y', 'cloudflare-warp'])
+    ui.section('配置 WARP 本地代理', '保留现有注册；代理地址 127.0.0.1:40000。')
     run(['systemctl', 'enable', '--now', 'warp-svc.service'])
     # Do not delete registrations, licenses or account settings.
     existing = run(['warp-cli', '--accept-tos', 'registration', 'show'], check=False, capture=True)
@@ -202,9 +316,10 @@ def install_warp(_):
     warp(['mode', 'proxy'])
     warp(['proxy', 'port', '40000'])
     warp(['connect'])
+    ui.message('info', '正在连接并测试真实 SOCKS5 请求…')
     for _ in range(12):
         if probe()[0]:
-            print('WARP SOCKS5 实际请求成功。下一步 export 或 prepare。')
+            ui.message('ok', 'WARP SOCKS5 实际请求成功。')
             return
         time.sleep(2)
     raise ValueError('WARP 未通过连通性检查。未修改 Xray，请查看 journalctl -u warp-svc。')
@@ -228,7 +343,9 @@ def export(args):
                        socks_style=args.socks_style)
     save(out / 'outbounds.json', cfg['outbounds'][1:])
     save(out / 'routing-rules.json', cfg['routing']['rules'])
-    print('已导出：', out, '；需合并到面板/全部配置中并由真实 Xray 校验，不是完整配置。')
+    ui.message('ok', '配置片段已导出。')
+    ui.detail('保存位置', out)
+    ui.message('info', '请合并到面板或完整配置中，再由 Xray 校验；片段不是完整 config。')
 
 
 def prepare(args):
@@ -238,9 +355,7 @@ def prepare(args):
         raise ValueError('检测到已有/残留的 WARP 分流，跳过重复配置；请用 status 检查，或 uninstall 恢复原配置。')
     count = len(cfg.get('routing', {}).get('rules', []))
     if args.rule_index is None and count:
-        print('已有路由规则（仅显示类型与出站，不显示用户凭据）：')
-        for i, rule in enumerate(cfg['routing']['rules']):
-            print(i, 'outbound=', rule.get('outboundTag', ''), 'fields=', ','.join(rule.keys()))
+        show_rules(cfg['routing']['rules'])
         raise ValueError('请用 --rule-index N 指定插入位置；API、安全拦截规则应保留在前，兜底规则应在后。')
     binary = service_context(args.service, path)
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + str(time.time_ns())[-6:]
@@ -254,15 +369,16 @@ def prepare(args):
     try:
         validate(binary, candidate)
     except subprocess.CalledProcessError:
-        print('尝试新版 SOCKS 出站字段格式……')
+        ui.message('info', '当前内核未接受旧版 SOCKS 字段，尝试新版格式…')
         modified = patch_config(cfg, domains_for(args), index, args.add_sniffing, 'current')
         save(candidate, modified)
         validate(binary, candidate)
     save(plan / 'manifest.json', {'config': str(path), 'service': args.service, 'binary': binary,
                                 'original_sha256': digest(path), 'candidate_sha256': digest(candidate),
                                 'domains': domains_for(args), 'rule_index': index})
-    print('候选配置通过当前 Xray 校验，尚未修改运行配置。计划目录：', plan)
-    print('检查 candidate.json 后运行：sudo python3 warp-xray.py apply --plan', plan)
+    ui.message('ok', '候选配置已生成并校验，尚未修改运行配置。')
+    ui.detail('备份与候选配置目录', plan)
+    ui.command('warp-xray apply --plan ' + str(plan))
     return plan
 
 
@@ -284,6 +400,7 @@ def replace_bytes(path, source):
 
 
 def restart_xray(service):
+    ui.message('info', '正在重启 Xray，现有连接会短暂中断…')
     run(['systemctl', 'restart', service])
     time.sleep(4)
     run(['systemctl', 'is-active', '--quiet', service])
@@ -311,8 +428,9 @@ def apply(args):
         restart_xray(m['service'])
         raise ValueError('新配置启动失败，已经恢复 Xray 原配置。')
     (plan / 'applied').write_text('applied\n')
-    print('已应用。现有旧透明代理仍需 cleanup-legacy；请用客户端测试 Google 和非 Google 网站。')
-    print('恢复命令：sudo python3 warp-xray.py restore --plan', plan)
+    ui.message('ok', '新配置已应用，Xray 服务已启动。')
+    ui.message('info', '请从客户端测试 Google 和其他网站；旧透明代理可用 cleanup-legacy 清理。')
+    ui.command('warp-xray restore --plan ' + str(plan))
 
 
 def restore(args):
@@ -331,7 +449,7 @@ def restore(args):
         replace_bytes(m['config'], plan / 'candidate.json')
         restart_xray(m['service'])
         raise ValueError('原配置未能启动，已换回候选配置。')
-    print('只恢复了 Xray 配置；不会重新启用旧透明代理或删除 WARP。')
+    ui.message('ok', 'Xray 原配置已恢复。WARP 保留，旧透明代理不会重新启用。')
 
 
 def cleanup(args, restoring=False):
@@ -398,8 +516,9 @@ def cleanup(args, restoring=False):
     if manager.exists() and 'WARP 管理工具  （VPS值得买' in manager.read_text():
         manager.unlink()
     # Leave redsocks processes/package/config intact: could be used by another service.
-    print('旧分流规则、开机服务和已识别管理命令已清理。备份：', backup)
-    print('未终止/卸载 redsocks；确认无其他用途后可自行停用。回滚 Xray 不会恢复旧透明代理。')
+    ui.message('ok', '旧分流规则、开机服务和已识别的管理命令已清理。')
+    ui.detail('清理前备份', backup)
+    ui.message('info', 'redsocks 可能由其他服务共用，仍然保留。')
 
 
 def checked_uninstall_plan(plan):
@@ -538,18 +657,22 @@ def finish_uninstall(archive):
     record = load(archive / 'uninstall.json')
     record['stage'] = 'complete'
     save(archive / 'uninstall.json', record)
-    print('卸载完成：原始 config 已恢复，WARP/健康检查/管理工具已移除。')
-    print('保留的原始配置及卸载前备份：', archive)
-    print('未卸载 Xray 或共享依赖，未自动恢复旧透明代理。')
+    ui.section('卸载完成')
+    ui.message('ok', '原始 config 已恢复，WARP、健康检查与管理工具已移除。')
+    ui.detail('保留的原始配置及卸载前备份', archive)
+    ui.message('info', 'Xray 与共享依赖仍然保留，旧透明代理不会重新启用。')
 
 
 def uninstall(args):
+    ui.section('完整卸载 · 恢复原始配置', '先验证备份与服务，再恢复配置，最后移除组件。')
     plan, m = select_uninstall_plan(args.plan)
     preflight_uninstall(plan, m)
-    print('将恢复：', m['config'], '；原始备份：', plan / 'original.json')
-    print('随后清除 WARP（含本地注册数据）、健康检查、源/密钥及本工具。其他 WARP 用途也会受影响。')
-    if input('确认完整卸载？请输入 UNINSTALL：').strip() != 'UNINSTALL':
-        print('已取消，未修改配置。')
+    ui.detail('将恢复的配置文件', m['config'])
+    ui.detail('原始备份', plan / 'original.json')
+    ui.message('warn', '将移除 WARP（含本地注册数据）、健康检查、源/密钥和本工具。')
+    ui.message('warn', '这台服务器上其他使用 WARP 的程序也会受影响。')
+    if ui.ask('输入 UNINSTALL 确认完整卸载', hint='直接回车或输入其他内容取消。') != 'UNINSTALL':
+        ui.message('info', '已取消，未修改配置。')
         return
     # Recheck after user review; never overwrite a concurrent edit.
     checked_uninstall_plan(plan)
@@ -563,6 +686,7 @@ def uninstall(args):
             shutil.copy2(path, archive / path.name)
     save(archive / 'uninstall.json', {'config': m['config'], 'service': m['service'],
                                     'plan': str(plan), 'stage': 'backed-up'})
+    ui.section('01 · 恢复 Xray 原配置')
     restore_for_uninstall(plan, m)
     # An offline WARP must not prevent removing legacy rules during uninstall.
     if Path('/usr/local/bin/warp-google').exists():
@@ -571,6 +695,7 @@ def uninstall(args):
     shutil.copytree(BASE, archive / 'state', dirs_exist_ok=True, symlinks=True)
     save(archive / 'uninstall.json', {'config': m['config'], 'service': m['service'],
                                     'plan': str(plan), 'stage': 'config-restored'})
+    ui.section('02 · 移除 WARP 与健康检查')
     remove_uninstall_components()
     save(archive / 'uninstall.json', {'config': m['config'], 'service': m['service'],
                                     'plan': str(plan), 'stage': 'package-removed'})
@@ -588,12 +713,12 @@ def watchdog(_):
     state = load(statepath) if statepath.exists() else {'failures': 0, 'last_restart': 0}
     if probe()[0]:
         if state['failures']:
-            print('WARP 代理恢复。')
+            ui.message('ok', 'WARP 代理恢复。')
         state['failures'] = 0
     else:
         state['failures'] += 1
         if state['failures'] >= 3 and time.time() - state['last_restart'] >= 900:
-            print('连续代理请求失败；恢复 warp-svc。不会重启 Xray、服务器或重注册账号。')
+            ui.message('warn', '连续代理请求失败，正在恢复 warp-svc。')
             state['last_restart'] = time.time()
             save(statepath, state)
             run(['systemctl', 'restart', 'warp-svc.service'])
@@ -617,66 +742,174 @@ def enable_health(_):
         'OnUnitActiveSec=1min\nRandomizedDelaySec=10s\n[Install]\nWantedBy=timers.target\n')
     run(['systemctl', 'daemon-reload'])
     run(['systemctl', 'enable', '--now', 'warp-xray-health.timer'])
-    print('已启用：连续 3 次失败后恢复服务；两次恢复至少间隔 15 分钟。')
+    ui.message('ok', '健康检查已启用。')
+    ui.text('约每分钟检查；连续 3 次失败后恢复服务，恢复间隔至少 15 分钟。', 'muted')
 
 
 def status(_):
-    run(['warp-cli', 'status'], check=False)
-    run(['systemctl', 'status', 'warp-xray-health.timer', '--no-pager'], check=False)
+    ui.section('运行状态', '服务状态与真实代理请求分别检查。')
+    if not shutil.which('warp-cli'):
+        ui.message('warn', '尚未检测到 WARP 客户端。')
+        ui.command('warp-xray install-warp')
+        return
+    client = run(['warp-cli', 'status'], check=False, capture=True)
+    ui.detail('WARP 客户端', client.stdout.strip() or client.stderr.strip() or '未返回状态')
+    for name, label in [('warp-svc.service', 'WARP 服务'), ('warp-xray-health.timer', '健康检查计时器')]:
+        result = run(['systemctl', 'is-active', name], check=False, capture=True)
+        state = result.stdout.strip() or 'unknown'
+        ui.message('ok' if state == 'active' else 'warn', label + '：' + state)
+    enabled = run(['systemctl', 'is-enabled', 'warp-xray-health.timer'], check=False, capture=True)
+    ui.detail('健康检查开机启动', enabled.stdout.strip() or '未启用')
+    ui.section('出口连通性', '下面测试 WARP 代理出口，不等于 Xray 分流规则已命中。')
     for family in (None, 'ipv4', 'ipv6'):
         ok, fields, error = probe(family)
-        print(family or 'auto', 'OK' if ok else 'FAIL', '出口=', fields.get('ip', '?'),
-              'warp=', fields.get('warp', '?'), error)
-    print('ipv4/ipv6 使用对应目标域名测试 WARP 出口；不是 VPS 入站双栈测试。')
+        label = {None: '自动选择', 'ipv4': 'IPv4 目标', 'ipv6': 'IPv6 目标'}[family]
+        ui.message('ok' if ok else 'warn', label + ('：代理请求通过' if ok else '：代理请求未通过'))
+        if fields.get('ip'):
+            ui.detail('出口 IP', fields['ip'])
+        if error:
+            ui.text(error, 'muted')
+        print('', flush=True)
+    ui.text('IPv4 / IPv6 使用对应目标域名测试，不是 VPS 入站双栈测试。', 'muted')
+
+
+def ask_config():
+    while True:
+        config = ui.ask('Xray 配置文件绝对路径', default='/usr/local/etc/xray/config.json',
+                        hint='需要具体 JSON 文件，例如 config.json，不能只填写目录。')
+        if not Path(config).is_absolute():
+            ui.message('warn', '请填写以 / 开头的绝对路径。')
+            continue
+        try:
+            return config, load(config)
+        except (OSError, ValueError) as exc:
+            ui.message('warn', str(exc))
+
+
+def ask_service():
+    while True:
+        service = ui.ask('systemd 服务名', default='xray.service', hint='填写服务名即可，不需要 /etc/systemd/system/ 路径。')
+        if service.startswith('/') and service.endswith('.service'):
+            service = Path(service).name
+            ui.message('info', '已识别服务名：' + service)
+        if re.fullmatch(r'[A-Za-z0-9_.@-]+\.service', service):
+            return service
+        ui.message('warn', '服务名应类似 xray.service。')
 
 
 def setup(_):
-    print('WARP + Xray 设置向导：操作前备份，应用时短暂重启 Xray。')
-    if input('安装/复用官方 WARP 并设为本地代理（接受 Cloudflare 条款）？[y/N] ').lower() == 'y':
+    ui.section('WARP + Xray · 设置向导', 'Google 流量分流 · Debian 12 / 13+')
+    ui.text('修改前会备份并校验；应用配置时会短暂重启 Xray。', 'muted')
+    ui.section('01 · 准备 WARP')
+    if ui.confirm('安装 / 复用官方 WARP，并设置本地代理？', hint='选择 y 表示接受 Cloudflare 条款；现有注册会保留。'):
         install_warp(None)
     if not probe()[0]:
         raise ValueError('WARP SOCKS5 未就绪，先运行 warp-xray install-warp。')
-    if input('是否由面板或多文件配置管理 Xray？[y/N] ').lower() == 'y':
-        dest = input('片段导出目录 [/root/warp-xray-fragments]：').strip() or '/root/warp-xray-fragments'
+    ui.message('ok', 'WARP 本地代理可用。')
+    ui.section('02 · 确认 Xray 配置方式')
+    if ui.confirm('Xray 是否由面板或多文件配置管理？', hint='例如 3x-ui / Marzban 或 -confdir；选择 y 将只导出配置片段。'):
+        dest = ui.ask('片段导出目录', default='/root/warp-xray-fragments')
         export(argparse.Namespace(output=dest, domains=None, socks_style='legacy'))
-        print('请在面板合并出站和路由；不直接修改面板配置，不自动清理旧透明代理。')
+        ui.message('info', '请在面板合并出站与路由。配置片段已生成，向导结束。')
         return
-    config = input('Xray 实际配置绝对路径：').strip()
-    if not Path(config).is_absolute():
-        raise ValueError('需要绝对路径。')
-    service = input('systemd 服务名 [xray.service]：').strip() or 'xray.service'
-    cfg = load(config)
+    config, cfg = ask_config()
+    service = ask_service()
     if managed_present(cfg):
-        print('检测到已有或残留的 WARP 分流，已跳过重复安装；不会再询问插入位置或覆盖备份。')
-        print('检查运行状态：warp-xray status；恢复原配置并卸载：warp-xray uninstall')
-        if input('是否启用/更新健康检查？[y/N] ').lower() == 'y':
+        ui.section('已检测到 WARP 分流')
+        ui.message('info', '跳过重复配置，保留原始备份。')
+        ui.command('warp-xray status')
+        ui.command('warp-xray uninstall')
+        if ui.confirm('启用 / 更新健康检查？'):
             enable_health(None)
         return
     rules = cfg.get('routing', {}).get('rules', [])
-    for i, rule in enumerate(rules):
-        print(i, 'outbound=', rule.get('outboundTag', ''), 'fields=', ','.join(rule.keys()))
-    print('Google 规则需位于 API/安全规则之后、兜底规则之前；不会改变默认出站。')
-    index = int(input(f'插入位置（0 到 {len(rules)}）：')) if rules else 0
-    sniff = input('对缺少嗅探配置的代理入站补充 routeOnly 嗅探？[y/N] ').lower() == 'y'
+    ui.section('03 · 设置 Google 分流')
+    index = ask_rule_index(rules)
+    sniff = ui.confirm('为缺少嗅探配置的入站补充域名嗅探？',
+                       hint='辅助识别 HTTP / TLS / QUIC 域名，仅用于路由；已有嗅探设置保留。')
+    ui.section('04 · 备份与校验候选配置')
     plan = prepare(argparse.Namespace(config=config, service=service, rule_index=index,
                                       add_sniffing=sniff, domains=None))
-    print('候选配置和域名列表已存放在', plan)
-    if input('现在应用候选配置并重启 Xray？[y/N] ').lower() != 'y':
-        print('尚未修改 Xray；之后可用 warp-xray apply --plan 路径。')
+    ui.detail('配置文件', config)
+    ui.detail('服务', service)
+    ui.detail('新规则插入位置', index)
+    if not ui.confirm('现在应用候选配置并重启 Xray？', hint='会短暂中断现有连接；启动失败时尝试恢复原配置。'):
+        ui.message('info', '已保留候选配置，尚未修改 Xray。')
         return
     apply(argparse.Namespace(plan=str(plan)))
+    ui.section('05 · 可选维护功能')
     if Path('/usr/local/bin/warp-google').exists():
-        if input('备份并清理已识别的旧 warp-g.sh 透明代理设置？[y/N] ').lower() == 'y':
+        if ui.confirm('备份并清理已识别的旧透明代理？', hint='适用于最初的 warp-g.sh，避免旧防火墙规则叠加。'):
             cleanup(argparse.Namespace(plan=str(plan)))
-    if input('启用 WARP 定时连通性检查及有限自动恢复？[y/N] ').lower() == 'y':
+    if ui.confirm('启用健康检查与有限自动恢复？', hint='约每分钟检查；连续 3 次失败才恢复 WARP，恢复间隔至少 15 分钟。'):
         enable_health(None)
-    print('请用客户端测试 Google/非 Google 网站并确认双栈；服务启动成功不代表分流验证完成。')
+    ui.section('配置完成')
+    ui.message('ok', 'Xray 分流配置已应用。')
+    ui.message('info', '请用客户端测试 Google、其他网站与 IPv4 / IPv6。')
+    ui.command('warp-xray status')
+
+
+def disable_health(_):
+    run(['systemctl', 'disable', '--now', 'warp-xray-health.timer'])
+    ui.message('ok', '健康检查已暂停，当前 WARP 连接不会被断开。')
+
+
+def menu(_):
+    while True:
+        ui.section('WARP + Xray · 管理菜单', 'Google 流量分流 · Debian 12 / 13+')
+        for item in ('1  安装 / 配置 Google 分流', '2  查看运行状态与出口',
+                     '3  开启 / 更新健康检查', '4  暂停健康检查',
+                     '5  仅恢复 Xray 原配置（保留 WARP）',
+                     '6  完整卸载并恢复原配置', '0  退出'):
+            ui.text(item)
+        choice = ui.ask('请选择操作', default='0')
+        if choice == '0':
+            ui.message('info', '已退出。')
+            return
+        try:
+            if choice == '1':
+                setup(None)
+            elif choice == '2':
+                status(None)
+            elif choice == '3':
+                enable_health(None)
+            elif choice == '4':
+                disable_health(None)
+            elif choice == '5':
+                directory = ui.ask('备份计划目录', hint='留空自动查找唯一匹配的已应用备份。')
+                plan, m = select_uninstall_plan(directory or None)
+                ui.detail('恢复目标', m['config'])
+                if digest(m['config']) == m['original_sha256']:
+                    ui.message('info', '文件内容已经是原配置；如需重新加载，请检查 Xray 服务。')
+                elif ui.confirm('恢复原配置并重启 Xray？', hint='仅恢复配置，WARP 与健康检查保留。'):
+                    restore(argparse.Namespace(plan=str(plan)))
+            elif choice == '6':
+                uninstall(argparse.Namespace(plan=None))
+                return
+            else:
+                ui.message('warn', '请选择 0 到 6。')
+                continue
+        except (ValueError, OSError, subprocess.SubprocessError) as exc:
+            report_error(exc)
+        ui.ask('按回车返回管理菜单')
+
+
+def report_error(exc):
+    print('', flush=True)
+    ui.message('error', str(exc))
+    if isinstance(exc, subprocess.CalledProcessError):
+        diagnostic = (exc.stderr or '').strip() or (exc.stdout or '').strip()
+        if diagnostic:
+            ui.text('命令返回信息：', 'muted')
+            ui.text(diagnostic)
+    print('', flush=True)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    sub = p.add_subparsers(dest='command', required=True)
-    for cmd in ('install-warp', 'status', 'enable-health', 'watchdog', 'disable-health', 'setup'):
+    p.add_argument('--no-color', action='store_true', help='关闭终端颜色（也支持 NO_COLOR）')
+    sub = p.add_subparsers(dest='command')
+    for cmd in ('install-warp', 'status', 'enable-health', 'watchdog', 'disable-health', 'setup', 'menu'):
         sub.add_parser(cmd)
     e = sub.add_parser('export', help='只导出面板/多文件配置需要合并的片段')
     e.add_argument('--output', required=True)
@@ -694,22 +927,28 @@ def main():
     u = sub.add_parser('uninstall', help='先恢复原始 Xray 配置，再完整卸载 WARP 和工具；保留备份')
     u.add_argument('--plan', help='指定原始计划；默认寻找唯一匹配的已应用备份')
     args = p.parse_args()
+    ui.no_color = args.no_color
+    args.command = args.command or 'menu'
     root()
     import fcntl
     # Serialize operator actions; watchdog uses its own lock to avoid nested locking.
     lock = open('/run/warp-xray-admin.lock', 'w')
     if args.command != 'watchdog':
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    actions = {'uninstall': uninstall, 'setup': setup, 'install-warp': install_warp, 'prepare': prepare, 'apply': apply,
+    actions = {'menu': menu, 'uninstall': uninstall, 'setup': setup, 'install-warp': install_warp, 'prepare': prepare, 'apply': apply,
                'restore': restore, 'export': export, 'cleanup-legacy': cleanup,
                'enable-health': enable_health, 'watchdog': watchdog, 'status': status,
-               'disable-health': lambda _: run(['systemctl', 'disable', '--now', 'warp-xray-health.timer'])}
+               'disable-health': disable_health}
     actions[args.command](args)
 
 
 if __name__ == '__main__':
     try:
         main()
-    except (ValueError, OSError, EOFError, subprocess.SubprocessError) as exc:
-        print('失败：', exc, file=sys.stderr)
+    except (KeyboardInterrupt, EOFError):
+        print('', flush=True)
+        ui.message('info', '操作已中止，终端日志已保留。')
+        sys.exit(130)
+    except (ValueError, OSError, subprocess.SubprocessError) as exc:
+        report_error(exc)
         sys.exit(1)

@@ -38,6 +38,27 @@ curl -fsSL https://raw.githubusercontent.com/brian952700/warp-xray-debian/main/i
 sudo warp-xray setup
 ```
 
+## 终端交互
+
+安装过程按步骤显示；成功、注意和错误分别用绿色、黄色和红色区分。输入项单独换行，提供默认值与示例，错误路径或序号可以重填。原始包管理输出保留，WARP 重复的裸 `Success` 输出合并为明确提示；命令失败仍显示诊断信息。
+
+直接输入命令打开管理菜单：
+
+```bash
+sudo warp-xray
+```
+
+支持纯文本终端和日志重定向：检测不到终端、`TERM=dumb`、设置了 `NO_COLOR` 或传入 `--no-color` 时不输出 ANSI 颜色。
+
+```bash
+sudo warp-xray --no-color status
+sudo env NO_COLOR=1 warp-xray
+```
+
+以下预览由程序的真实菜单输出渲染，用于展示布局和配色，不是 VPS 运行状态截图：
+
+![新版终端界面](terminal-preview.png)
+
 ## 设置向导
 
 向导会询问：
@@ -75,6 +96,7 @@ sudo apt-get -f install
 
 ```bash
 sudo warp-xray status
+sudo warp-xray
 sudo warp-xray setup
 sudo warp-xray enable-health
 sudo warp-xray disable-health
