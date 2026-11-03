@@ -12,7 +12,7 @@
 服务器已有 curl 时执行：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/brian952700/warp-xray-debian/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/brian952700/warp-xray-debian/main/install.sh | bash
 ```
 
 root 用户也可以使用 `| bash`。极简系统先安装 curl：
