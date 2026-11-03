@@ -159,6 +159,30 @@ sudo bash warp-xray.sh prepare \
 
 ## 恢复与故障收集
 
+### 新增：重复安装检测和完整卸载
+
+新版会在询问插入位置前识别已有/残留的 WARP 分流并跳过重复安装。配置路径必须指向 JSON 文件，填写目录时会给出明确提示。
+
+更新已安装的管理工具（不重新配置 Xray）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/brian952700/warp-xray-debian/main/install.sh | sudo bash -s -- --download-only
+```
+
+完整卸载并恢复原 config：
+
+```bash
+sudo warp-xray uninstall
+# 若有多个备份而无法唯一确定，指定原始计划：
+sudo warp-xray uninstall --plan /var/lib/warp-xray/plan-实际编号
+```
+
+输入 UNINSTALL 确认后，先校验备份与实际服务、恢复原 config 并重启 Xray，成功后再清理健康检查、WARP 软件包、本地注册数据、软件源/密钥及工具。归档保留在 `/var/backups/warp-xray/时间编号/`，包括原始计划、卸载前 config 和阶段记录。原配置无法启动时尝试换回当前分流配置，不继续卸载。
+
+config 已有后续修改或缺少有效备份时拒绝覆盖；不会卸载 Xray，不自动清理共享依赖/redsocks，不删除系统 journal，不自动恢复旧透明代理。未知旧规则或其他依赖 WARP 的跟踪配置会阻止完整卸载。面板/多文件模式需在面板中自行恢复，不支持自动恢复导出的片段。
+
+### 只恢复配置、不卸载 WARP
+
 ```bash
 sudo bash warp-xray.sh restore --plan /var/lib/warp-xray/plan-实际编号
 ```

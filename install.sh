@@ -62,7 +62,7 @@ PY
     chmod 700 "$task_wrapper"
     mv -f -- "$task_wrapper" /usr/local/bin/warp-xray
     echo "已安装 warp-xray，提交：$task_sha"
-    echo '命令：warp-xray setup / status / prepare / apply / restore'
+    echo '命令：warp-xray setup / status / prepare / apply / restore / uninstall'
     if [[ "$action" == --download-only ]]; then
         return
     fi

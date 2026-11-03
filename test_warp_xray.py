@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 import subprocess
+import contextlib
 
 ROOT = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('wx', ROOT / 'warp-xray.py')
@@ -89,6 +90,32 @@ class ConfigTests(unittest.TestCase):
             export.assert_called_once()
             prepare.assert_not_called()
 
+    def test_setup_existing_config_stops_before_insertion_prompt(self):
+        cfg = wx.patch_config(self.cfg, wx.DOMAINS, 2)
+        with patch('builtins.input', side_effect=['n', 'n', str(ROOT / 'config.json'), '', 'n']) as ask, \
+                patch.object(wx, 'probe', return_value=(True, {}, '')), \
+                patch.object(wx, 'load', return_value=cfg), \
+                patch.object(wx, 'prepare') as prepare, patch.object(wx, 'apply') as apply:
+            wx.setup(None)
+            prepare.assert_not_called()
+            apply.assert_not_called()
+            self.assertFalse(any('插入位置' in call.args[0] for call in ask.call_args_list))
+
+    def test_prepare_existing_rules_refuses_before_backup(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'config.json'
+            # Rule-only remnants also block an automatic insertion.
+            wx.save(path, {'routing': {'rules': [{'outboundTag': wx.TAG}]}})
+            with patch.object(wx, 'service_context') as service:
+                with self.assertRaisesRegex(ValueError, '重复配置'):
+                    wx.prepare(type('Args', (), {'config': str(path)})())
+                service.assert_not_called()
+
+    def test_directory_path_error_is_actionable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(ValueError, '不能填写目录'):
+                wx.load(temp)
+
     def test_reject_duplicate_keys_jsonc(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / 'config.json'
@@ -167,6 +194,176 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(current.read_bytes(), (plan / 'original.json').read_bytes())
             with self.assertRaises(ValueError):
                 wx.restore(args)
+
+
+class UninstallTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.state = self.root / 'state'
+        self.plan = self.state / 'plan-first'
+        self.plan.mkdir(parents=True)
+        self.config = self.root / 'config.json'
+        self.original = {'outbounds': [{'protocol': 'freedom', 'tag': 'direct'}]}
+        self.candidate = wx.patch_config(self.original, wx.DOMAINS, 0)
+        wx.save(self.plan / 'original.json', self.original)
+        wx.save(self.plan / 'candidate.json', self.candidate)
+        wx.save(self.config, self.candidate)
+        self.manifest = {'config': str(self.config), 'service': 'xray.service',
+                         'original_sha256': wx.digest(self.plan / 'original.json'),
+                         'candidate_sha256': wx.digest(self.plan / 'candidate.json')}
+        wx.save(self.plan / 'manifest.json', self.manifest)
+        (self.plan / 'applied').write_text('applied')
+        self.install = self.root / 'installed'
+        self.install.mkdir()
+        (self.install / 'warp-xray.py').write_text('test')
+        self.wrapper = self.root / 'warp-xray'
+        self.wrapper.write_text('exec /usr/local/lib/warp-xray/warp-xray.py')
+        self.archives = self.root / 'archives'
+        self.stack = contextlib.ExitStack()
+        self.addCleanup(self.stack.close)
+        for name, value in {'BASE': self.state, 'ARCHIVES': self.archives,
+                            'INSTALL_ROOT': self.install, 'WRAPPER': self.wrapper,
+                            'HEALTH_UNITS': [self.root / 'warp-xray-health.timer', self.root / 'warp-xray-health.service'],
+                            'WARP_REPO': self.root / 'cloudflare-client.list',
+                            'WARP_KEY': self.root / 'cloudflare-key.gpg',
+                            'WARP_DIRS': [self.root / 'warp-state', self.root / 'warp-log']}.items():
+            self.stack.enter_context(patch.object(wx, name, value))
+        self.stack.enter_context(patch.object(wx, 'service_context', return_value='xray'))
+        self.stack.enter_context(patch.object(wx, 'validate'))
+        self.stack.enter_context(patch.object(wx.os, 'chown', create=True))
+        self.stack.enter_context(patch.object(wx.shutil, 'which', return_value=None))
+
+    def args(self):
+        return type('Args', (), {'plan': None})()
+
+    def test_automatic_plan_works_for_old_installations(self):
+        self.assertEqual(wx.select_uninstall_plan()[0], self.plan)
+
+    def test_missing_backup_stops(self):
+        (self.plan / 'original.json').unlink()
+        with self.assertRaises(ValueError):
+            wx.select_uninstall_plan()
+
+    def test_corrupted_backup_stops(self):
+        (self.plan / 'original.json').write_text('{}')
+        with self.assertRaisesRegex(ValueError, '哈希'):
+            wx.checked_uninstall_plan(self.plan)
+
+    def test_modified_live_config_stops(self):
+        self.config.write_text('{"later":"edit"}')
+        with self.assertRaisesRegex(ValueError, '后续修改'):
+            wx.checked_uninstall_plan(self.plan)
+
+    def test_backup_with_managed_rules_stops(self):
+        wx.save(self.plan / 'original.json', self.candidate)
+        self.manifest['original_sha256'] = wx.digest(self.plan / 'original.json')
+        wx.save(self.plan / 'manifest.json', self.manifest)
+        with self.assertRaisesRegex(ValueError, '不是可恢复'):
+            wx.checked_uninstall_plan(self.plan)
+
+    def test_multiple_live_configurations_are_not_chosen_arbitrarily(self):
+        other = self.state / 'plan-second'
+        other.mkdir()
+        for name in ('original.json', 'candidate.json'):
+            (other / name).write_bytes((self.plan / name).read_bytes())
+        m = dict(self.manifest)
+        m['config'] = str(self.root / 'other.json')
+        wx.save(m['config'], self.candidate)
+        wx.save(other / 'manifest.json', m)
+        (other / 'applied').write_text('applied')
+        with self.assertRaisesRegex(ValueError, '唯一'):
+            wx.select_uninstall_plan()
+        with self.assertRaisesRegex(ValueError, '另一个配置'):
+            wx.preflight_uninstall(self.plan, self.manifest)
+
+    def test_cancel_does_not_restore_or_remove(self):
+        with patch('builtins.input', return_value='n'), patch.object(wx, 'preflight_uninstall'), \
+                patch.object(wx, 'restore_for_uninstall') as restore, \
+                patch.object(wx, 'remove_uninstall_components') as remove:
+            wx.uninstall(self.args())
+            restore.assert_not_called()
+            remove.assert_not_called()
+            self.assertFalse(self.archives.exists())
+
+    def test_success_restores_before_removal_and_archives_backups(self):
+        def remove():
+            self.assertEqual(wx.digest(self.config), self.manifest['original_sha256'])
+        with patch('builtins.input', return_value='UNINSTALL'), patch.object(wx, 'preflight_uninstall'), \
+                patch.object(wx, 'restart_xray'), patch.object(wx, 'remove_uninstall_components', side_effect=remove):
+            wx.uninstall(self.args())
+        self.assertEqual(wx.load(self.config), self.original)
+        self.assertFalse(self.wrapper.exists())
+        self.assertFalse(self.install.exists())
+        self.assertFalse(self.state.exists())
+        archive = next(self.archives.iterdir())
+        self.assertEqual(wx.load(archive / 'state' / self.plan.name / 'original.json'), self.original)
+        self.assertEqual(wx.load(archive / 'uninstall.json')['stage'], 'complete')
+
+    def test_restore_failure_keeps_warp_and_tools(self):
+        with patch('builtins.input', return_value='UNINSTALL'), patch.object(wx, 'preflight_uninstall'), \
+                patch.object(wx, 'restart_xray', side_effect=[RuntimeError('start failed'), None]), \
+                patch.object(wx, 'remove_uninstall_components') as remove:
+            with self.assertRaises(ValueError):
+                wx.uninstall(self.args())
+            remove.assert_not_called()
+        self.assertEqual(wx.load(self.config), self.candidate)
+        self.assertTrue(self.wrapper.exists())
+        self.assertTrue(self.state.exists())
+
+    def test_package_failure_leaves_restored_config_and_retryable_tools(self):
+        with patch('builtins.input', return_value='UNINSTALL'), patch.object(wx, 'preflight_uninstall'), \
+                patch.object(wx, 'restart_xray'), \
+                patch.object(wx, 'remove_uninstall_components', side_effect=RuntimeError('apt failed')):
+            with self.assertRaises(RuntimeError):
+                wx.uninstall(self.args())
+        self.assertEqual(wx.load(self.config), self.original)
+        self.assertTrue(self.wrapper.exists())
+        self.assertEqual(wx.select_uninstall_plan()[0], self.plan)
+
+    def test_already_restored_file_still_restarts_live_xray(self):
+        wx.save(self.config, self.original)
+        with patch.object(wx, 'restart_xray') as restart:
+            wx.restore_for_uninstall(self.plan, self.manifest)
+            restart.assert_called_once_with('xray.service')
+
+    def test_unknown_health_unit_blocks_removal(self):
+        wx.HEALTH_UNITS[0].write_text('[Timer]\nOnBootSec=1min\n')
+        with self.assertRaisesRegex(ValueError, '单元内容不符'):
+            wx.preflight_uninstall(self.plan, self.manifest)
+
+    def test_original_health_unit_formats_pass_preflight(self):
+        wx.HEALTH_UNITS[0].write_text(
+            '[Unit]\nDescription=Periodic WARP proxy health check\n'
+            '[Timer]\nOnUnitActiveSec=1min\n')
+        wx.HEALTH_UNITS[1].write_text(
+            '[Service]\nExecStart=/usr/bin/python3 /usr/local/lib/warp-xray/warp-xray.py watchdog\n')
+        wx.preflight_uninstall(self.plan, self.manifest)
+
+    def test_shared_source_key_blocks_removal(self):
+        wx.WARP_KEY.write_text('key')
+        (self.root / 'another.sources').write_text('Signed-By: ' + str(wx.WARP_KEY))
+        with self.assertRaisesRegex(ValueError, '其他 APT 源'):
+            wx.preflight_uninstall(self.plan, self.manifest)
+
+    def test_remove_components_purges_only_warp_without_autoremove(self):
+        wx.WARP_REPO.write_text('deb https://pkg.cloudflareclient.com/ trixie main')
+        wx.WARP_KEY.write_text('key')
+        for path in wx.WARP_DIRS:
+            path.mkdir()
+            (path / 'state').write_text('state')
+        with patch.object(wx, 'stop_health') as stop, \
+                patch.object(wx, 'run', return_value=subprocess.CompletedProcess([], 0, 'loaded\n', '')) as run, \
+                patch.object(wx, 'apt') as apt:
+            wx.remove_uninstall_components()
+            stop.assert_called_once()
+            apt.assert_called_once_with(['purge', '-y', 'cloudflare-warp'])
+            self.assertTrue(any(c.args[0] == ['systemctl', 'disable', '--now', 'warp-svc.service'] for c in run.call_args_list))
+        self.assertFalse(wx.WARP_REPO.exists())
+        self.assertFalse(wx.WARP_KEY.exists())
+        self.assertTrue(all(not p.exists() for p in wx.WARP_DIRS))
+        self.assertTrue(self.wrapper.exists())
 
 
 if __name__ == '__main__':

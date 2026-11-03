@@ -79,6 +79,7 @@ sudo warp-xray setup
 sudo warp-xray enable-health
 sudo warp-xray disable-health
 sudo warp-xray restore --plan /var/lib/warp-xray/plan-实际编号
+sudo warp-xray uninstall
 ```
 
 连续三次代理连通性检查失败才恢复 warp-svc，恢复间隔至少 15 分钟；不会自动重注册、换 IP、重启 Xray 或重启服务器。健康检查运行日志：
@@ -86,6 +87,43 @@ sudo warp-xray restore --plan /var/lib/warp-xray/plan-实际编号
 ```bash
 sudo journalctl -u warp-xray-health.service -n 60 --no-pager
 ```
+
+## 重复安装与完整卸载
+
+新版 setup/prepare 会提前检测已有的 WARP 出站或路由标记，跳过重复插入，不再询问规则位置，也不覆盖原始备份。setup 可选择更新健康检查。检测到标记不代表运行中的 Xray 已加载配置，仍需业务验证。
+
+已经安装旧版的服务器，先只更新工具，不重新配置：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/brian952700/warp-xray-debian/main/install.sh | sudo bash -s -- --download-only
+```
+
+然后完整卸载：
+
+```bash
+sudo warp-xray uninstall
+```
+
+脚本会自动查找唯一匹配的已应用备份；也可指定：
+
+```bash
+sudo warp-xray uninstall --plan /var/lib/warp-xray/plan-实际编号
+```
+
+显示原配置和备份位置后，需要输入 `UNINSTALL` 确认。顺序为：
+
+1. 检查原备份及候选配置哈希、当前 config、实际 Xray 服务和原配置语法。
+2. 将卸载前 config、原计划、相关服务与源文件备份到 `/var/backups/warp-xray/时间编号/`。
+3. 恢复原始 config 并重启 Xray；原配置无法启动时换回分流配置，停止卸载，不删除 WARP。
+4. 清理能识别的旧透明代理规则（可离线进行，不要求 WARP 此时连通）。
+5. 停用并移除健康检查，断开并停用 WARP，用 APT purge 移除 `cloudflare-warp`。
+6. 删除固定的 WARP 源/密钥、本地 WARP 注册/配置/日志目录、工具命令、工具版本及活动状态目录。
+
+**保留 Xray、共享依赖、卸载归档和系统 journal。** 不执行 autoremove，不重启服务器。旧 redsocks 可能被其他服务使用，不会全局结束或卸载；这也不是清除一切历史痕迹的功能。
+
+没有可验证的备份、备份损坏、当前 config 有后续修改、另一个已跟踪配置仍依赖 WARP、遇到未知旧规则或共享密钥等情况，会停止并给出提示，不盲目覆盖或卸载。面板/多文件导出模式没有可自动恢复的单文件计划，需先在面板恢复配置，不能用此功能绕过面板。
+
+APT purge 等后续步骤失败时，原始 config 可能已恢复，但管理工具和计划仍保留，可修复错误后重试；卸载归档中的 `uninstall.json` 记录已完成阶段。完整卸载会影响这台服务器其他使用 WARP 的程序，执行前确认用途。
 
 ## 使用边界
 

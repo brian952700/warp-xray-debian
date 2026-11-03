@@ -15,6 +15,15 @@ import tempfile
 import time
 
 BASE = Path('/var/lib/warp-xray')
+ARCHIVES = Path('/var/backups/warp-xray')
+INSTALL_ROOT = Path('/usr/local/lib/warp-xray')
+WRAPPER = Path('/usr/local/bin/warp-xray')
+HEALTH_UNITS = [Path('/etc/systemd/system/warp-xray-health.timer'),
+                Path('/etc/systemd/system/warp-xray-health.service')]
+WARP_REPO = Path('/etc/apt/sources.list.d/cloudflare-client.list')
+WARP_KEY = Path('/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg')
+WARP_DIRS = [Path('/var/lib/cloudflare-warp'), Path('/var/log/cloudflare-warp'),
+             Path('/etc/cloudflare-warp')]
 TAG = 'warp-google-managed'
 BLOCK = 'warp-google-udp-managed'
 DOMAINS = ['google.com', 'googleapis.com', 'gstatic.com', 'googleusercontent.com',
@@ -51,6 +60,8 @@ def digest(path):
 
 
 def load(path):
+    if not Path(path).is_file():
+        raise ValueError('需要具体的配置/清单文件，不能填写目录：' + str(path))
     # Reject JSONC, duplicate keys, and malformed JSON rather than silently discard settings.
     def unique(items):
         result = {}
@@ -60,6 +71,12 @@ def load(path):
             result[key] = value
         return result
     return json.loads(Path(path).read_text(encoding='utf-8-sig'), object_pairs_hook=unique)
+
+
+def managed_present(cfg):
+    return (any(x.get('tag') in (TAG, BLOCK) for x in cfg.get('outbounds', [])) or
+            any(x.get('outboundTag') in (TAG, BLOCK)
+                for x in cfg.get('routing', {}).get('rules', [])))
 
 
 def save(path, obj):
@@ -217,6 +234,8 @@ def export(args):
 def prepare(args):
     path = Path(args.config).resolve(strict=True)
     cfg = load(path)
+    if managed_present(cfg):
+        raise ValueError('检测到已有/残留的 WARP 分流，跳过重复配置；请用 status 检查，或 uninstall 恢复原配置。')
     count = len(cfg.get('routing', {}).get('rules', []))
     if args.rule_index is None and count:
         print('已有路由规则（仅显示类型与出站，不显示用户凭据）：')
@@ -315,7 +334,7 @@ def restore(args):
     print('只恢复了 Xray 配置；不会重新启用旧透明代理或删除 WARP。')
 
 
-def cleanup(args):
+def cleanup(args, restoring=False):
     # Only accept the known legacy script, never execute an unknown file as root.
     old = Path('/usr/local/bin/warp-google')
     if not old.exists():
@@ -325,9 +344,10 @@ def cleanup(args):
         raise ValueError('旧脚本与已知版本不符，请人工检查。')
     plan = Path(args.plan).resolve(strict=True)
     m = load(plan / 'manifest.json')
-    if not (plan / 'applied').exists() or digest(m['config']) != m['candidate_sha256']:
+    expected = m['original_sha256'] if restoring else m['candidate_sha256']
+    if (not restoring and not (plan / 'applied').exists()) or digest(m['config']) != expected:
         raise ValueError('请先应用并验证 Xray 分流计划，再清理旧配置。')
-    if not probe()[0]:
+    if not restoring and not probe()[0]:
         raise ValueError('WARP 不可用，暂不清理。')
     backup = plan / ('legacy-' + str(time.time_ns()))
     backup.mkdir(mode=0o700)
@@ -380,6 +400,181 @@ def cleanup(args):
     # Leave redsocks processes/package/config intact: could be used by another service.
     print('旧分流规则、开机服务和已识别管理命令已清理。备份：', backup)
     print('未终止/卸载 redsocks；确认无其他用途后可自行停用。回滚 Xray 不会恢复旧透明代理。')
+
+
+def checked_uninstall_plan(plan):
+    plan = Path(plan).resolve(strict=True)
+    m = load(plan / 'manifest.json')
+    original = plan / 'original.json'
+    candidate = plan / 'candidate.json'
+    if digest(original) != m['original_sha256'] or digest(candidate) != m['candidate_sha256']:
+        raise ValueError('备份或候选配置哈希不符，拒绝卸载。')
+    if managed_present(load(original)):
+        raise ValueError('该备份仍含有本工具的分流标记，不是可恢复的原始配置。')
+    current = digest(m['config'])
+    if current not in (m['original_sha256'], m['candidate_sha256']):
+        raise ValueError('当前 config 已有后续修改，拒绝覆盖。请人工合并原始备份后再卸载。')
+    return plan, m
+
+
+def select_uninstall_plan(explicit=None):
+    if explicit:
+        return checked_uninstall_plan(explicit)
+    matches = []
+    for directory in sorted(BASE.glob('plan-*'), reverse=True):
+        try:
+            plan, m = checked_uninstall_plan(directory)
+            if (plan / 'applied').exists() or digest(m['config']) == m['candidate_sha256']:
+                matches.append((plan, m))
+        except (ValueError, OSError, KeyError):
+            continue
+    # Equivalent duplicate plans have identical restore content. Never choose
+    # arbitrarily between different files, services, or original backups.
+    choices = {(m['config'], m['service'], m['original_sha256']) for _, m in matches}
+    if len(choices) != 1:
+        raise ValueError('找不到唯一可恢复的已应用计划；请用 uninstall --plan /var/lib/warp-xray/plan-编号 指定原备份。')
+    return matches[0]
+
+
+def preflight_uninstall(plan, m):
+    # No other tracked config may still depend on the WARP package.
+    for directory in BASE.glob('plan-*'):
+        manifest = directory / 'manifest.json'
+        if not manifest.is_file():
+            continue
+        other = load(manifest)
+        path = Path(other['config'])
+        if path.resolve() != Path(m['config']).resolve() and path.exists() and managed_present(load(path)):
+            raise ValueError('另一个配置仍在使用 WARP 分流，请先 restore：' + str(path))
+    for path in [BASE, INSTALL_ROOT, *WARP_DIRS]:
+        if path.exists() or path.is_symlink():
+            if path.is_symlink() or path.resolve() != path.absolute():
+                raise ValueError('安装/数据目录含符号链接，拒绝自动递归删除：' + str(path))
+    for path in HEALTH_UNITS:
+        if path.exists():
+            content = path.read_text()
+            owned = ('Description=Periodic WARP proxy health check' in content and
+                     'OnUnitActiveSec=1min' in content) if path.suffix == '.timer' else (
+                         'ExecStart=/usr/bin/python3 /usr/local/lib/warp-xray/warp-xray.py watchdog' in content)
+            if not owned:
+                raise ValueError('健康检查单元内容不符，拒绝删除：' + str(path))
+    if WRAPPER.exists() and '/warp-xray.py' not in WRAPPER.read_text():
+        raise ValueError('warp-xray 命令不属于本工具，拒绝删除。')
+    if WARP_REPO.exists():
+        lines = [s.strip() for s in WARP_REPO.read_text().splitlines() if s.strip() and not s.lstrip().startswith('#')]
+        if any('https://pkg.cloudflareclient.com/' not in s for s in lines):
+            raise ValueError('Cloudflare 源文件含其他内容，拒绝自动删除。')
+    # A shared signing key must not be removed while another source uses it.
+    if WARP_KEY.exists():
+        for source in WARP_REPO.parent.iterdir():
+            if source != WARP_REPO and source.is_file() and source.suffix in ('.list', '.sources'):
+                if str(WARP_KEY) in source.read_text():
+                    raise ValueError('其他 APT 源仍引用 WARP 密钥，请先人工处理：' + str(source))
+    old = Path('/usr/local/bin/warp-google')
+    oldunit = Path('/etc/systemd/system/warp-google.service')
+    chain = (run(['iptables', '-w', '5', '-t', 'nat', '-S', 'WARP_GOOGLE'],
+                 check=False, capture=True).returncode == 0) if shutil.which('iptables') else False
+    if old.exists():
+        if not all(s in old.read_text() for s in ('WARP_GOOGLE', 'redsocks -c /etc/redsocks.conf', '--to-ports 12345')):
+            raise ValueError('存在未知旧透明代理脚本，请先人工清理。')
+        if oldunit.exists() and 'ExecStop=/usr/local/bin/warp-google stop' not in oldunit.read_text():
+            raise ValueError('存在未知旧透明代理服务，请先人工清理。')
+    elif oldunit.exists() or chain:
+        raise ValueError('旧透明代理标记不完整，请先人工清理其服务/规则；本次未修改配置。')
+    binary = service_context(m['service'], m['config'])
+    validate(binary, plan / 'original.json')
+
+
+def restore_for_uninstall(plan, m):
+    if digest(m['config']) == m['candidate_sha256']:
+        restore(argparse.Namespace(plan=str(plan)))
+    else:
+        # The file may already be restored, but the live process may still have
+        # old rules. Restart it before disconnecting WARP.
+        restart_xray(m['service'])
+    service_context(m['service'], m['config'])
+    if digest(m['config']) != m['original_sha256']:
+        raise ValueError('恢复后 config 再次变化，停止卸载 WARP。')
+
+
+def stop_health():
+    for path in HEALTH_UNITS:
+        if path.exists():
+            if path.suffix == '.timer':
+                run(['systemctl', 'disable', '--now', path.name])
+            else:
+                run(['systemctl', 'stop', path.name])
+
+
+def remove_uninstall_components():
+    stop_health()
+    for path in HEALTH_UNITS:
+        path.unlink(missing_ok=True)
+    run(['systemctl', 'daemon-reload'])
+    if shutil.which('warp-cli'):
+        run(['warp-cli', '--accept-tos', 'disconnect'], check=False)
+    state = run(['systemctl', 'show', 'warp-svc.service', '-p', 'LoadState', '--value'], capture=True)
+    if state.stdout.strip() != 'not-found':
+        run(['systemctl', 'disable', '--now', 'warp-svc.service'])
+    apt(['purge', '-y', 'cloudflare-warp'])
+    for path in (WARP_REPO, WARP_KEY):
+        path.unlink(missing_ok=True)
+    for path in WARP_DIRS:
+        if path.exists():
+            if path.is_symlink() or path.resolve() != path.absolute():
+                raise ValueError('WARP 数据路径变化，拒绝删除：' + str(path))
+            shutil.rmtree(path)
+    run(['systemctl', 'daemon-reload'])
+
+
+def finish_uninstall(archive):
+    # Called only after a validated restore and successful package purge.
+    WRAPPER.unlink(missing_ok=True)
+    for path in (INSTALL_ROOT, BASE):
+        if path.exists():
+            if path.is_symlink() or path.resolve() != path.absolute():
+                raise ValueError('工具目录路径变化，拒绝删除：' + str(path))
+            shutil.rmtree(path)
+    record = load(archive / 'uninstall.json')
+    record['stage'] = 'complete'
+    save(archive / 'uninstall.json', record)
+    print('卸载完成：原始 config 已恢复，WARP/健康检查/管理工具已移除。')
+    print('保留的原始配置及卸载前备份：', archive)
+    print('未卸载 Xray 或共享依赖，未自动恢复旧透明代理。')
+
+
+def uninstall(args):
+    plan, m = select_uninstall_plan(args.plan)
+    preflight_uninstall(plan, m)
+    print('将恢复：', m['config'], '；原始备份：', plan / 'original.json')
+    print('随后清除 WARP（含本地注册数据）、健康检查、源/密钥及本工具。其他 WARP 用途也会受影响。')
+    if input('确认完整卸载？请输入 UNINSTALL：').strip() != 'UNINSTALL':
+        print('已取消，未修改配置。')
+        return
+    # Recheck after user review; never overwrite a concurrent edit.
+    checked_uninstall_plan(plan)
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ') + '-' + str(time.time_ns())[-6:]
+    archive = ARCHIVES / stamp
+    archive.mkdir(mode=0o700, parents=True)
+    shutil.copytree(BASE, archive / 'state', symlinks=True)
+    shutil.copy2(m['config'], archive / 'config-before-uninstall.json')
+    for path in [*HEALTH_UNITS, WARP_REPO, WARP_KEY]:
+        if path.exists():
+            shutil.copy2(path, archive / path.name)
+    save(archive / 'uninstall.json', {'config': m['config'], 'service': m['service'],
+                                    'plan': str(plan), 'stage': 'backed-up'})
+    restore_for_uninstall(plan, m)
+    # An offline WARP must not prevent removing legacy rules during uninstall.
+    if Path('/usr/local/bin/warp-google').exists():
+        cleanup(argparse.Namespace(plan=str(plan)), restoring=True)
+    # Preserve the legacy cleanup backup created after the initial snapshot.
+    shutil.copytree(BASE, archive / 'state', dirs_exist_ok=True, symlinks=True)
+    save(archive / 'uninstall.json', {'config': m['config'], 'service': m['service'],
+                                    'plan': str(plan), 'stage': 'config-restored'})
+    remove_uninstall_components()
+    save(archive / 'uninstall.json', {'config': m['config'], 'service': m['service'],
+                                    'plan': str(plan), 'stage': 'package-removed'})
+    finish_uninstall(archive)
 
 
 def watchdog(_):
@@ -451,6 +646,12 @@ def setup(_):
         raise ValueError('需要绝对路径。')
     service = input('systemd 服务名 [xray.service]：').strip() or 'xray.service'
     cfg = load(config)
+    if managed_present(cfg):
+        print('检测到已有或残留的 WARP 分流，已跳过重复安装；不会再询问插入位置或覆盖备份。')
+        print('检查运行状态：warp-xray status；恢复原配置并卸载：warp-xray uninstall')
+        if input('是否启用/更新健康检查？[y/N] ').lower() == 'y':
+            enable_health(None)
+        return
     rules = cfg.get('routing', {}).get('rules', [])
     for i, rule in enumerate(rules):
         print(i, 'outbound=', rule.get('outboundTag', ''), 'fields=', ','.join(rule.keys()))
@@ -490,6 +691,8 @@ def main():
     for cmd in ('apply', 'restore', 'cleanup-legacy'):
         q = sub.add_parser(cmd)
         q.add_argument('--plan', required=True)
+    u = sub.add_parser('uninstall', help='先恢复原始 Xray 配置，再完整卸载 WARP 和工具；保留备份')
+    u.add_argument('--plan', help='指定原始计划；默认寻找唯一匹配的已应用备份')
     args = p.parse_args()
     root()
     import fcntl
@@ -497,7 +700,7 @@ def main():
     lock = open('/run/warp-xray-admin.lock', 'w')
     if args.command != 'watchdog':
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    actions = {'setup': setup, 'install-warp': install_warp, 'prepare': prepare, 'apply': apply,
+    actions = {'uninstall': uninstall, 'setup': setup, 'install-warp': install_warp, 'prepare': prepare, 'apply': apply,
                'restore': restore, 'export': export, 'cleanup-legacy': cleanup,
                'enable-health': enable_health, 'watchdog': watchdog, 'status': status,
                'disable-health': lambda _: run(['systemctl', 'disable', '--now', 'warp-xray-health.timer'])}
