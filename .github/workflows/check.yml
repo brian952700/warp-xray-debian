@@ -33,3 +33,7 @@ jobs:
         run: |
           bash install.sh --download-only
           /usr/local/bin/warp-xray --help
+      - name: Menu smoke test
+        run: |
+          printf '0\n' | python3 warp-xray.py --no-color menu
+          printf '0\n' | /usr/local/bin/warp-xray --no-color
