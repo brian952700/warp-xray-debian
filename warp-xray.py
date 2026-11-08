@@ -48,8 +48,9 @@ class TerminalUI:
     def width(self):
         return max(12, min(72, shutil.get_terminal_size(fallback=(80, 24)).columns - 4))
 
-    def wrap(self, text):
+    def wrap(self, text, columns=None):
         # Chinese terminal glyphs occupy two columns. ANSI is added after wrapping.
+        columns = self.width() if columns is None else columns
         lines, line, size = [], '', 0
         for char in str(text):
             if char == '\n':
@@ -57,7 +58,7 @@ class TerminalUI:
                 line, size = '', 0
                 continue
             width = 0 if unicodedata.combining(char) else (2 if unicodedata.east_asian_width(char) in 'WF' else 1)
-            if size + width > self.width() and line:
+            if size + width > columns and line:
                 lines.append(line)
                 line, size = '', 0
             line += char
@@ -65,18 +66,23 @@ class TerminalUI:
         lines.append(line)
         return lines
 
+    def formatted(self, text, kind=None, columns=None):
+        return '\n'.join('  ' + (self.paint(line, kind) if kind else line)
+                         for line in self.wrap(text, columns))
+
     def text(self, text='', kind=None):
-        for line in self.wrap(text):
-            print('  ' + (self.paint(line, kind) if kind else line), flush=True)
+        print(self.formatted(text, kind), flush=True)
+
+    def section_text(self, title, subtitle=None):
+        columns = self.width()
+        divider = self.formatted('─' * columns, 'muted', columns)
+        lines = ['', divider, self.formatted(title, 'title', columns)]
+        if subtitle:
+            lines.append(self.formatted(subtitle, 'muted', columns))
+        return '\n'.join([*lines, divider, ''])
 
     def section(self, title, subtitle=None):
-        print('', flush=True)
-        self.text('─' * self.width(), 'muted')
-        self.text(title, 'title')
-        if subtitle:
-            self.text(subtitle, 'muted')
-        self.text('─' * self.width(), 'muted')
-        print('', flush=True)
+        print(self.section_text(title, subtitle), flush=True)
 
     def message(self, kind, text):
         self.text(f'[{self.labels[kind]}] {text}', kind)
@@ -89,13 +95,14 @@ class TerminalUI:
         print('', flush=True)
         print(self.paint('  $ ' + command, 'info'), flush=True)
 
-    def ask(self, label, default=None, hint=None):
-        print('', flush=True)
-        self.text(label, 'prompt')
+    def ask(self, label, default=None, hint=None, prefix=''):
+        columns = self.width()
+        lines = [prefix, self.formatted(label, 'prompt', columns)]
         if hint:
-            self.text(hint, 'muted')
+            lines.append(self.formatted(hint, 'muted', columns))
         suffix = f' [默认：{default}]' if default is not None else ''
-        answer = input(self.paint('  >' + suffix + ' ', 'prompt')).strip()
+        lines.append(self.paint('  >' + suffix + ' ', 'prompt'))
+        answer = input('\n'.join(lines)).strip()
         return answer if answer else (default if default is not None else '')
 
     def confirm(self, label, hint=None):
@@ -856,13 +863,12 @@ def disable_health(_):
 
 def menu(_):
     while True:
-        ui.section('WARP + Xray · 管理菜单', 'Google 流量分流 · Debian 12 / 13+')
-        for item in ('1  安装 / 配置 Google 分流', '2  查看运行状态与出口',
-                     '3  开启 / 更新健康检查', '4  暂停健康检查',
-                     '5  仅恢复 Xray 原配置（保留 WARP）',
-                     '6  完整卸载并恢复原配置', '0  退出'):
-            ui.text(item)
-        choice = ui.ask('请选择操作', default='0')
+        header = ui.section_text('WARP + Xray · 管理菜单', 'Google 流量分流 · Debian 12 / 13+')
+        items = ui.formatted('1  安装 / 配置 Google 分流\n2  查看运行状态与出口\n'
+                             '3  开启 / 更新健康检查\n4  暂停健康检查\n'
+                             '5  仅恢复 Xray 原配置（保留 WARP）\n'
+                             '6  完整卸载并恢复原配置\n0  退出')
+        choice = ui.ask('请选择操作', default='0', prefix=header + '\n' + items + '\n')
         if choice == '0':
             ui.message('info', '已退出。')
             return
