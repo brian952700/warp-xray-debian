@@ -96,6 +96,7 @@ sudo apt-get -f install
 
 ```bash
 sudo warp-xray status
+sudo warp-xray status --quick
 sudo warp-xray
 sudo warp-xray setup
 sudo warp-xray enable-health
@@ -104,11 +105,15 @@ sudo warp-xray restore --plan /var/lib/warp-xray/plan-实际编号
 sudo warp-xray uninstall
 ```
 
-连续三次代理连通性检查失败才恢复 warp-svc，恢复间隔至少 15 分钟；不会自动重注册、换 IP、重启 Xray 或重启服务器。健康检查运行日志：
+`status` 通过 WARP 代理并行探测自动、IPv4、IPv6 三种目标。`status --quick` 仅查询本地服务和计时器。
+
+健康检查连续三次失败后会先用备用地址确认，再尝试连接。连接后仍无法通过代理测试时，才重启 WARP 服务。服务重启尝试至少间隔 15 分钟。使用新版安装器更新时，旧版健康检查单元会迁移到当前管理入口。
 
 ```bash
 sudo journalctl -u warp-xray-health.service -n 60 --no-pager
 ```
+
+配置准备从同一份原始内容生成备份、候选和校验值。脚本在替换前再次校验实时配置，启动失败时使用已核验的内容回滚。若 Xray 已停止，`restore` 可通过有效的 systemd 启动参数核对单个配置文件后恢复。
 
 ## 重复安装与完整卸载
 

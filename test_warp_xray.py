@@ -7,6 +7,7 @@ from unittest.mock import patch
 import subprocess
 import contextlib
 import io
+import threading
 
 ROOT = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('wx', ROOT / 'warp-xray.py')
@@ -16,6 +17,9 @@ spec.loader.exec_module(wx)
 
 class ConfigTests(unittest.TestCase):
     def setUp(self):
+        lock = patch.object(wx, 'mutation_lock', contextlib.nullcontext)
+        lock.start()
+        self.addCleanup(lock.stop)
         self.cfg = {'inbounds': [{'protocol': 'vless', 'settings': {'clients': [{'id': 'secret'}]}}],
                     'outbounds': [{'tag': 'direct', 'protocol': 'freedom'},
                                   {'tag': 'deny', 'protocol': 'blackhole'}],
@@ -72,6 +76,55 @@ class ConfigTests(unittest.TestCase):
         with patch.object(wx, 'run', return_value=subprocess.CompletedProcess([], 0, 'warp=on\n', '')) as run:
             wx.probe()
             self.assertEqual(run.call_args.kwargs['timeout'], 18)
+
+    def test_network_timeout_is_a_failed_probe(self):
+        with patch.object(wx, 'run', side_effect=subprocess.TimeoutExpired(['curl'], 2)):
+            ok, fields, error = wx.probe(timeout=2)
+        self.assertFalse(ok)
+        self.assertEqual(fields, {})
+        self.assertIn('timed out', error)
+
+    def test_healthy_install_reuses_proxy_without_apt_or_registration(self):
+        with patch.object(wx, 'package_installed', return_value=True), \
+             patch.object(wx.shutil, 'which', return_value='/usr/bin/warp-cli'), \
+             patch.object(wx, 'probe', return_value=(True, {}, '')), \
+             patch.object(wx, 'run') as run, patch.object(wx, 'apt') as apt, \
+             patch.object(wx, 'warp') as warp:
+            wx.install_warp(None)
+        apt.assert_not_called()
+        warp.assert_not_called()
+        self.assertEqual(run.call_args.args[0], ['systemctl', 'enable', '--now', 'warp-svc.service'])
+
+    def test_transient_registration_error_does_not_register(self):
+        command_error = subprocess.CompletedProcess([], 1, '', 'Unable to connect to the daemon')
+        with patch.object(wx, 'run', return_value=command_error), \
+             patch.object(wx.time, 'sleep'), patch.object(wx, 'warp') as warp:
+            with self.assertRaisesRegex(ValueError, '无法确认 WARP 注册状态'):
+                wx.ensure_warp_registration()
+        warp.assert_not_called()
+
+    def test_explicit_missing_registration_is_created(self):
+        missing = subprocess.CompletedProcess([], 1, '', 'Error: Missing registration')
+        with patch.object(wx, 'run', return_value=missing), patch.object(wx, 'warp') as warp:
+            wx.ensure_warp_registration()
+        warp.assert_called_once_with(['registration', 'new'], timeout=30)
+
+    def test_status_probes_in_parallel_and_quick_skips_network(self):
+        barrier = threading.Barrier(3, timeout=3)
+
+        def probe(family):
+            barrier.wait()
+            return True, {}, ''
+
+        state = subprocess.CompletedProcess([], 0, 'active', '')
+        with patch.object(wx.shutil, 'which', return_value='/usr/bin/warp-cli'), \
+             patch.object(wx, 'run', return_value=state), \
+             patch.object(wx, 'probe', side_effect=probe) as probe_mock:
+            wx.status(type('Args', (), {'quick': True})())
+            probe_mock.assert_not_called()
+            wx.status(None)
+            self.assertCountEqual([call.args[0] for call in probe_mock.call_args_list],
+                                  [None, 'ipv4', 'ipv6'])
 
     def test_setup_decline_never_applies(self):
         with patch('builtins.input', side_effect=['n', 'n', str(ROOT / 'config.json'), '', '2', 'n', 'n']), \
@@ -200,6 +253,12 @@ class ConfigTests(unittest.TestCase):
             self.assertNotIn('-6', argv)
             self.assertIn('socks5h://127.0.0.1:40000', argv)
 
+    def test_proxy_family_requires_matching_exit_ip(self):
+        response = subprocess.CompletedProcess([], 0, 'warp=on\nip=203.0.113.10\n', '')
+        with patch.object(wx, 'run', return_value=response):
+            self.assertTrue(wx.probe('ipv4')[0])
+            self.assertFalse(wx.probe('ipv6')[0])
+
     def test_apply_rollback_and_hash_guards(self):
         with tempfile.TemporaryDirectory() as temp:
             plan = Path(temp)
@@ -273,6 +332,7 @@ class UninstallTests(unittest.TestCase):
         self.archives = self.root / 'archives'
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(wx, 'mutation_lock', contextlib.nullcontext))
         for name, value in {'BASE': self.state, 'ARCHIVES': self.archives,
                             'INSTALL_ROOT': self.install, 'WRAPPER': self.wrapper,
                             'HEALTH_UNITS': [self.root / 'warp-xray-health.timer', self.root / 'warp-xray-health.service'],
