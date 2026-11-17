@@ -8,11 +8,48 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Shell syntax
-        run: bash -n install.sh warp-xray.sh
+        run: |
+          bash -n install.sh
+          bash -n warp-xray.sh
+          bash -n test_installer.sh
       - name: Python tests
         run: python3 -m unittest discover -s . -v
       - name: Verify payload checksums
         run: sha256sum -c SHA256SUMS
+      - name: Verify generated configurations, rollback and stopped-service restore
+        run: |
+          xray_fixture="$(mktemp -d)"
+          trap 'rm -rf -- "$xray_fixture"' EXIT
+          curl --fail --silent --show-error --location --retry 2 --max-time 120 \
+            https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip \
+            -o "$xray_fixture/xray.zip"
+          # SHA256 from the upstream XTLS release asset.
+          printf '%s  %s\n' '23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae' \
+            "$xray_fixture/xray.zip" | sha256sum -c -
+          unzip -p "$xray_fixture/xray.zip" xray > "$xray_fixture/xray"
+          chmod 700 "$xray_fixture/xray"
+          python3 - "$xray_fixture" <<'PY'
+          import json
+          from pathlib import Path
+          import runpy
+          import subprocess
+          import sys
+
+          fixture = Path(sys.argv[1])
+          helper = runpy.run_path('warp-xray.py')
+          original = {
+              'inbounds': [{'listen': '127.0.0.1', 'port': 10808,
+                            'protocol': 'socks', 'settings': {'auth': 'noauth'}}],
+              'outbounds': [{'tag': 'direct', 'protocol': 'freedom'}],
+              'routing': {'rules': [{'type': 'field', 'network': 'tcp,udp', 'outboundTag': 'direct'}]},
+          }
+          for style in ('legacy', 'current'):
+              candidate = helper['patch_config'](original, helper['DOMAINS'], 0, sniff=True, socks_style=style)
+              path = fixture / f'{style}.json'
+              path.write_text(json.dumps(candidate))
+              subprocess.run([str(fixture / 'xray'), 'run', '-test', '-config', str(path)], check=True)
+          PY
+          sudo env GITHUB_ACTIONS=true python3 test_xray_systemd.py "$xray_fixture/xray"
   debian:
     runs-on: ubuntu-latest
     strategy:
@@ -22,17 +59,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install test runtime
-        run: apt-get update && apt-get install -y python3 ca-certificates
+        run: apt-get update && apt-get install -y python3 ca-certificates util-linux
       - name: Syntax and unit tests
         run: |
-          bash -n install.sh warp-xray.sh
+          bash -n install.sh
+          bash -n warp-xray.sh
           python3 -m unittest discover -s . -v
           python3 warp-xray.py --help
           sha256sum -c SHA256SUMS
-      - name: Installer download-only smoke test
-        run: |
-          bash install.sh --download-only
-          /usr/local/bin/warp-xray --help
+      - name: Install the checked-out payload without a TTY
+        run: bash test_installer.sh
       - name: Menu smoke test
         run: |
           printf '0\n' | python3 warp-xray.py --no-color menu
