@@ -59,7 +59,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install test runtime
-        run: apt-get update && apt-get install -y python3 ca-certificates util-linux
+        run: apt-get update && apt-get install -y python3 ca-certificates util-linux curl
       - name: Syntax and unit tests
         run: |
           bash -n install.sh
