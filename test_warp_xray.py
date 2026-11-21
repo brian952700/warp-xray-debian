@@ -276,7 +276,8 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(argv[argv.index('--connect-to') + 1], destination)
                 for switch in ('-4', '-6', '--ipv4', '--ipv6', '-k', '--insecure'):
                     self.assertNotIn(switch, argv)
-                self.assertIn('socks5h://127.0.0.1:40000', argv)
+                self.assertIn('socks5://127.0.0.1:40000', argv)
+                self.assertNotIn('socks5h://127.0.0.1:40000', argv)
 
     def test_automatic_and_override_probes_do_not_pin_destination(self):
         for family, override, expected in [(None, None, 'https://www.cloudflare.com/cdn-cgi/trace'),
@@ -392,10 +393,12 @@ class ProbeSocksTests(unittest.TestCase):
 
                 thread = threading.Thread(target=server, daemon=True)
                 thread.start()
-                proxy = f'socks5h://127.0.0.1:{listener.getsockname()[1]}'
+                port = listener.getsockname()[1]
+                proxies = {f'{scheme}://127.0.0.1:40000': f'{scheme}://127.0.0.1:{port}'
+                           for scheme in ('socks5', 'socks5h')}
 
                 def local_run(argv, **kwargs):
-                    argv = [proxy if arg == 'socks5h://127.0.0.1:40000' else arg for arg in argv]
+                    argv = [proxies.get(arg, arg) for arg in argv]
                     return original_run(argv, **kwargs)
 
                 with patch.object(wx, 'run', side_effect=local_run):

@@ -355,9 +355,12 @@ def probe(family=None, *, timeout=18, url=None):
     target = url or ('https://one.one.one.one/cdn-cgi/trace' if destination
                      else 'https://www.cloudflare.com/cdn-cgi/trace')
     curl_timeout = min(12, timeout * 0.9)
+    # SOCKS5h may encode an IPv6 literal as a domain. Local resolution of the
+    # pinned numeric address sends an IPv6 SOCKS target without a DNS lookup.
+    proxy = 'socks5' if destination and not url else 'socks5h'
     cmd = ['curl', '-q', '--silent', '--show-error', '--fail', '--noproxy', '',
            '--connect-timeout', str(min(5, curl_timeout)), '--max-time', str(curl_timeout),
-           '--proxy', 'socks5h://127.0.0.1:40000']
+           '--proxy', f'{proxy}://127.0.0.1:40000']
     if destination and not url:
         cmd.extend(['--connect-to', f'one.one.one.one:443:{destination}:443'])
     cmd.append(target)
