@@ -1132,12 +1132,8 @@ def setup(_):
     elif not probe()[0]:
         raise ValueError('WARP SOCKS5 未就绪，先运行 warp-xray install-warp。')
     ui.message('ok', 'WARP 本地代理可用。')
-    ui.section('02 · 确认 Xray 配置方式')
-    if ui.confirm('Xray 是否由面板或多文件配置管理？', hint='例如 3x-ui / Marzban 或 -confdir；选择 y 将只导出配置片段。'):
-        dest = ui.ask('片段导出目录', default='/root/warp-xray-fragments')
-        mutate(export, argparse.Namespace(output=dest, domains=None, socks_style='legacy'))
-        ui.message('info', '请在面板合并出站与路由。配置片段已生成，向导结束。')
-        return
+    ui.section('02 · 选择 Xray 配置文件')
+    ui.text('使用面板或多文件配置时，请运行 warp-xray export 导出片段。', 'muted')
     config, cfg = ask_config()
     service = ask_service()
     if managed_present(cfg):

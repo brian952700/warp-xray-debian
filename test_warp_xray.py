@@ -146,7 +146,7 @@ class ConfigTests(unittest.TestCase):
         probe.assert_not_called()
 
     def test_setup_decline_never_applies(self):
-        with patch('builtins.input', side_effect=['n', 'n', str(ROOT / 'config.json'), '', '2', 'n', 'n']), \
+        with patch('builtins.input', side_effect=['n', str(ROOT / 'config.json'), '', '2', 'n', 'n']), \
                 patch.object(wx, 'probe', return_value=(True, {}, '')), \
                 patch.object(wx, 'load', return_value=self.cfg), \
                 patch.object(wx, 'prepare', return_value=Path('/var/lib/warp-xray/plan-test')), \
@@ -155,17 +155,9 @@ class ConfigTests(unittest.TestCase):
             apply.assert_not_called()
             install.assert_not_called()
 
-    def test_setup_panel_exports_without_config_write(self):
-        with patch('builtins.input', side_effect=['n', 'y', '/root/fragments']), \
-                patch.object(wx, 'probe', return_value=(True, {}, '')), \
-                patch.object(wx, 'export') as export, patch.object(wx, 'prepare') as prepare:
-            wx.setup(None)
-            export.assert_called_once()
-            prepare.assert_not_called()
-
     def test_setup_existing_config_stops_before_insertion_prompt(self):
         cfg = wx.patch_config(self.cfg, wx.DOMAINS, 2)
-        with patch('builtins.input', side_effect=['n', 'n', str(ROOT / 'config.json'), '', 'n']) as ask, \
+        with patch('builtins.input', side_effect=['n', str(ROOT / 'config.json'), '', 'n']) as ask, \
                 patch.object(wx, 'probe', return_value=(True, {}, '')), \
                 patch.object(wx, 'load', return_value=cfg), \
                 patch.object(wx, 'prepare') as prepare, patch.object(wx, 'apply') as apply:
