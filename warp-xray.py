@@ -349,13 +349,18 @@ def validate(binary, path):
 
 
 def probe(family=None, *, timeout=18, url=None):
-    # The SOCKS server itself is IPv4. Test a family-specific remote target,
-    # rather than applying curl's -4/-6 to the loopback proxy connection.
-    target = url or f'https://{family or "www"}.cloudflare.com/cdn-cgi/trace'
+    # Pin only the SOCKS destination. Keep the original hostname for TLS/SNI
+    # and leave the IPv4 loopback proxy connection unrestricted.
+    destination = {'ipv4': '1.1.1.1', 'ipv6': '[2606:4700:4700::1111]'}.get(family)
+    target = url or ('https://one.one.one.one/cdn-cgi/trace' if destination
+                     else 'https://www.cloudflare.com/cdn-cgi/trace')
     curl_timeout = min(12, timeout * 0.9)
     cmd = ['curl', '-q', '--silent', '--show-error', '--fail', '--noproxy', '',
            '--connect-timeout', str(min(5, curl_timeout)), '--max-time', str(curl_timeout),
-           '--proxy', 'socks5h://127.0.0.1:40000', target]
+           '--proxy', 'socks5h://127.0.0.1:40000']
+    if destination and not url:
+        cmd.extend(['--connect-to', f'one.one.one.one:443:{destination}:443'])
+    cmd.append(target)
     try:
         result = run(cmd, check=False, capture=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1059,11 +1064,14 @@ def status(args):
         ui.command('warp-xray install-warp')
         return
     try:
-        client = run(['warp-cli', 'status'], check=False, capture=True, timeout=5)
+        client = run(['warp-cli', '--accept-tos', 'status'], check=False, capture=True, timeout=5)
     except subprocess.TimeoutExpired:
         ui.message('warn', 'WARP 客户端状态查询超时。')
     else:
-        ui.detail('WARP 客户端', client.stdout.strip() or client.stderr.strip() or '未返回状态')
+        detail = client.stdout.strip() or client.stderr.strip() or '未返回状态'
+        if client.returncode:
+            ui.message('warn', 'WARP 客户端状态查询失败。')
+        ui.detail('WARP 客户端', detail)
     for name, label in [('warp-svc.service', 'WARP 服务'), ('warp-xray-health.timer', '健康检查计时器')]:
         result = run(['systemctl', 'is-active', name], check=False, capture=True, timeout=5)
         state = result.stdout.strip() or 'unknown'
@@ -1084,7 +1092,8 @@ def status(args):
         if error:
             ui.text(error, 'muted')
         print('', flush=True)
-    ui.text('IPv4 / IPv6 使用对应目标域名测试，不是 VPS 入站双栈测试。', 'muted')
+    ui.text('IPv4 / IPv6 通过 WARP 代理访问固定地址，并校验出口 IP 地址族。', 'muted')
+    ui.text('各项显示本次目标请求结果，VPS 入站能力需另行检查。', 'muted')
 
 
 def ask_config():

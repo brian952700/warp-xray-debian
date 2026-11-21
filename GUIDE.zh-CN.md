@@ -38,7 +38,7 @@ sudo bash warp-xray.sh status
 
 本命令代表接受 WARP 条款并允许切换到 proxy 模式、设置端口 40000；会影响原先使用 WARP 全局模式的其他服务。如果已安装客户端，则复用现有版本，不自动升级。首次安装使用 Cloudflare 官方 APT 源和签名校验。不能在官方源不支持当前代号时继续安装。
 
-`status` 分别使用自动、IPv4 目标、IPv6 目标进行真实 SOCKS 请求。`warp=on`/`plus` 才视为健康。IPv6 测试失败不能声称完整双栈已可用；也不能用 `curl -6 -x socks5h://127.0.0.1:40000` 测 IPv6 出口，因为这会限制本地 SOCKS 连接的地址族。
+`status` 分别使用自动、IPv4 目标、IPv6 目标进行真实 SOCKS 请求。`warp=on`/`plus` 才视为健康。IPv4、IPv6 都请求 `https://one.one.one.one/cdn-cgi/trace`，使用 curl 的 `--connect-to` 分别固定目标地址为 `1.1.1.1`、`2606:4700:4700::1111`，保留原域名的 TLS/SNI 和证书校验。两项均校验出口 IP 地址族。固定地址可以避免专用探测域名解析失败。自动项成功表示该次代理请求可用，固定目标失败时应结合其他测试结果判断。VPS 入站双栈能力需单独测试。
 
 ## 3A. 普通单文件 Xray：生成候选配置
 
@@ -192,7 +192,7 @@ sudo bash warp-xray.sh restore --plan /var/lib/warp-xray/plan-实际编号
 只恢复该计划的 Xray 原始配置。如果当前配置已被面板/其他操作修改，或备份哈希不符，会拒绝覆盖，需人工合并。不会自动恢复旧透明代理、全局 WARP 模式、系统包或源，也不会卸载 WARP。清理前文件位于计划内 legacy 子目录，必要时人工审阅恢复。
 
 ```bash
-warp-cli status
+warp-cli --accept-tos status
 sudo journalctl -u warp-svc -n 100 --no-pager
 sudo journalctl -u xray.service -n 100 --no-pager
 sudo journalctl -u warp-xray-health.service -n 100 --no-pager

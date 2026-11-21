@@ -8,6 +8,8 @@ import subprocess
 import contextlib
 import io
 import threading
+import socket
+import shutil
 
 ROOT = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location('wx', ROOT / 'warp-xray.py')
@@ -125,6 +127,23 @@ class ConfigTests(unittest.TestCase):
             wx.status(None)
             self.assertCountEqual([call.args[0] for call in probe_mock.call_args_list],
                                   [None, 'ipv4', 'ipv6'])
+
+    def test_status_accepts_tos_and_warns_on_client_failure(self):
+        def command(argv, **kwargs):
+            if argv[0] == 'warp-cli':
+                return subprocess.CompletedProcess(argv, 1, '', 'Unable to connect to the daemon')
+            return subprocess.CompletedProcess(argv, 0, 'active', '')
+
+        output = io.StringIO()
+        with patch.object(wx.shutil, 'which', return_value='/usr/bin/warp-cli'), \
+             patch.object(wx, 'run', side_effect=command) as run, \
+             patch.object(wx.sys, 'stdout', output), patch.object(wx, 'probe') as probe:
+            wx.status(type('Args', (), {'quick': True})())
+        client_calls = [call.args[0] for call in run.call_args_list if call.args[0][0] == 'warp-cli']
+        self.assertEqual(client_calls, [['warp-cli', '--accept-tos', 'status']])
+        self.assertIn('[注意] WARP 客户端状态查询失败', output.getvalue())
+        self.assertIn('Unable to connect to the daemon', output.getvalue())
+        probe.assert_not_called()
 
     def test_setup_decline_never_applies(self):
         with patch('builtins.input', side_effect=['n', 'n', str(ROOT / 'config.json'), '', '2', 'n', 'n']), \
@@ -246,12 +265,30 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(wx.probe()[0], expected)
 
     def test_proxy_family_is_destination_not_curl_switch(self):
-        with patch.object(wx, 'run', return_value=subprocess.CompletedProcess([], 0, 'warp=on\n', '')) as r:
-            wx.probe('ipv6')
-            argv = r.call_args.args[0]
-            self.assertEqual(argv[-1], 'https://ipv6.cloudflare.com/cdn-cgi/trace')
-            self.assertNotIn('-6', argv)
-            self.assertIn('socks5h://127.0.0.1:40000', argv)
+        destinations = {'ipv4': 'one.one.one.one:443:1.1.1.1:443',
+                        'ipv6': 'one.one.one.one:443:[2606:4700:4700::1111]:443'}
+        for family, destination in destinations.items():
+            with self.subTest(family=family), \
+                 patch.object(wx, 'run', return_value=subprocess.CompletedProcess([], 0, 'warp=on\n', '')) as r:
+                wx.probe(family)
+                argv = r.call_args.args[0]
+                self.assertEqual(argv[-1], 'https://one.one.one.one/cdn-cgi/trace')
+                self.assertEqual(argv[argv.index('--connect-to') + 1], destination)
+                for switch in ('-4', '-6', '--ipv4', '--ipv6', '-k', '--insecure'):
+                    self.assertNotIn(switch, argv)
+                self.assertIn('socks5h://127.0.0.1:40000', argv)
+
+    def test_automatic_and_override_probes_do_not_pin_destination(self):
+        for family, override, expected in [(None, None, 'https://www.cloudflare.com/cdn-cgi/trace'),
+                                           (None, wx.HEALTH_FALLBACK_URL, wx.HEALTH_FALLBACK_URL),
+                                           ('ipv6', wx.HEALTH_FALLBACK_URL, wx.HEALTH_FALLBACK_URL)]:
+            with self.subTest(family=family, override=override), \
+                 patch.object(wx, 'run', return_value=subprocess.CompletedProcess([], 0, 'warp=on\n', '')) as r:
+                wx.probe(family, url=override)
+                argv = r.call_args.args[0]
+                self.assertEqual(argv[-1], expected)
+                self.assertNotIn('--connect-to', argv)
+                self.assertIn('socks5h://127.0.0.1:40000', argv)
 
     def test_proxy_family_requires_matching_exit_ip(self):
         response = subprocess.CompletedProcess([], 0, 'warp=on\nip=203.0.113.10\n', '')
@@ -303,6 +340,71 @@ class ConfigTests(unittest.TestCase):
                 self.assertEqual(current.read_bytes(), (plan / 'original.json').read_bytes())
             with self.assertRaises(ValueError):
                 wx.restore(args)
+
+
+@unittest.skipIf(wx.os.name == 'nt', 'real curl loopback test runs on Linux CI')
+@unittest.skipUnless(shutil.which('curl'), 'curl is required for the loopback SOCKS integration test')
+class ProbeSocksTests(unittest.TestCase):
+    def test_family_probe_sends_literal_target_through_ipv4_proxy(self):
+        # Refuse CONNECT after recording it: this tests curl's real SOCKS
+        # address encoding without making any connection to the internet.
+        original_run = wx.run
+        for family, address, atyp in [('ipv4', '1.1.1.1', 1),
+                                      ('ipv6', '2606:4700:4700::1111', 4)]:
+            with self.subTest(family=family), socket.socket() as listener:
+                listener.bind(('127.0.0.1', 0))
+                listener.listen(1)
+                listener.settimeout(5)
+                requests, errors = [], []
+
+                def exact(conn, length):
+                    result = b''
+                    while len(result) < length:
+                        chunk = conn.recv(length - len(result))
+                        if not chunk:
+                            raise EOFError('curl closed the SOCKS handshake early')
+                        result += chunk
+                    return result
+
+                def server():
+                    try:
+                        with listener.accept()[0] as conn:
+                            conn.settimeout(5)
+                            version, methods = exact(conn, 2)
+                            self.assertEqual(version, 5)
+                            self.assertIn(0, exact(conn, methods))
+                            conn.sendall(b'\x05\x00')
+                            version, command, reserved, kind = exact(conn, 4)
+                            self.assertEqual((version, command, reserved), (5, 1, 0))
+                            if kind == 1:
+                                destination = socket.inet_ntop(socket.AF_INET, exact(conn, 4))
+                            elif kind == 4:
+                                destination = socket.inet_ntop(socket.AF_INET6, exact(conn, 16))
+                            elif kind == 3:
+                                destination = exact(conn, exact(conn, 1)[0]).decode('ascii')
+                            else:
+                                raise AssertionError(f'Unexpected SOCKS address type {kind}')
+                            port = int.from_bytes(exact(conn, 2), 'big')
+                            requests.append((kind, destination, port))
+                            conn.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
+                    except Exception as exc:
+                        errors.append(exc)
+
+                thread = threading.Thread(target=server, daemon=True)
+                thread.start()
+                proxy = f'socks5h://127.0.0.1:{listener.getsockname()[1]}'
+
+                def local_run(argv, **kwargs):
+                    argv = [proxy if arg == 'socks5h://127.0.0.1:40000' else arg for arg in argv]
+                    return original_run(argv, **kwargs)
+
+                with patch.object(wx, 'run', side_effect=local_run):
+                    ok, _, _ = wx.probe(family, timeout=3)
+                thread.join(timeout=6)
+                self.assertFalse(thread.is_alive(), 'SOCKS server did not finish')
+                self.assertEqual(errors, [])
+                self.assertEqual(requests, [(atyp, address, 443)])
+                self.assertFalse(ok, 'The fake proxy deliberately rejects the connection')
 
 
 class UninstallTests(unittest.TestCase):
